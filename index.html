@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenPapers | Australia High School Past Paper Repository</title>
+    <meta id="meta-desc" name="description" content="Browse, download, and verify past papers from any Australian school and state. Free, open-source, community-verified past paper archive running on Google's CDN.">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
+        .glass-nav { background: rgba(255,255,255,0.85); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.5); }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        .bg-theme { background-color: #ffe294; }
+        .hover-bg-theme:hover { background-color: #ebd085; }
+        #global-drop-overlay { position: fixed; inset: 0; background: rgba(255,242,148,0.92); backdrop-filter: blur(8px); z-index: 80; display: none; align-items: center; justify-content: center; flex-direction: column; border: 4px dashed #8a6a1c; }
+        #global-drop-overlay.active { display: flex; }
+        .drag-active { border-color: #ffe294 !important; background-color: #fffbeb !important; }
+    </style>
+</head>
+<body class="text-slate-800 min-h-screen flex flex-col">
+
+<div id="global-drop-overlay">
+    <i class="fa-solid fa-cloud-arrow-up text-6xl text-slate-800 mb-4"></i>
+    <h3 class="text-2xl font-black text-slate-900">Drop PDFs to upload</h3>
+    <p class="text-sm font-bold text-slate-700 mt-1">To <span id="drop-path-label" class="font-black"></span> • Batch supported</p>
+</div>
+
+<script>
+    const API_URL = "https://script.google.com/macros/s/AKfycbwUJJ0pEhbrCs4hy8az__uRfagziDsV0EZiGL2IWy8dv8_k7M4AQwSl2Jl-p9dGIoXL8Q/exec";
+    let cachedData = [];
+    let currentUser = JSON.parse(localStorage.getItem('openpapers_user')) || null;
+    let userIP = "Unknown", batchQueue = [];
+    let driveCache = {};
+    let currentDrivePath = [];
+    let driveFolders = [];
+    let driveFiles = [];
+    let isCurrentLeaf = false;
+    let currentSearchQuery = "";
+    let fileMap = {};
+    let globalDragSetup = false;
+    let lastDropTime = 0;
+    let currentSortMode = "school-asc";
+
+    fetch('https://api.ipify.org?format=json').then(r=>r.json()).then(d=>userIP=d.ip).catch(()=>{});
+
+    async function fetchApi(payload){
+        return await fetch(API_URL, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body:JSON.stringify(payload), redirect:'follow'}).then(r=>r.json()).catch(e=>({success:false, message:"Network Error"}));
+    }
+
+    async function backgroundSyncPreservePath(){
+        try{
+            const res = await fetchApi({action:"get_data"});
+            if(res.success) cachedData = res.data || [];
+        }catch(e){}
+        const pathToLoad = [...currentDrivePath];
+        const key = pathToLoad.join('/')||'__root__';
+        delete driveCache[key]; // force refresh this folder only
+        await loadDriveFolder(pathToLoad);
+        renderDirectory();
+        document.getElementById('loading').classList.add('hidden');
+        updateAuthUI();
+    }
+
+    async function initialLoad(){
+        try{
+            const res = await fetchApi({action:"get_data"});
+            if(res.success) cachedData = res.data || [];
+        }catch(e){}
+        await loadDriveFolder([]);
+        renderDirectory();
+        document.getElementById('loading').classList.add('hidden');
+        updateAuthUI();
+        setupGlobalDragOnce();
+    }
+
+    async function loadDriveFolder(pathArray){
+        const key = pathArray.join('/') || '__root__';
+        if(driveCache[key]){
+            driveFolders = driveCache[key].folders;
+            driveFiles = driveCache[key].files;
+            isCurrentLeaf = driveCache[key].isLeaf;
+            currentDrivePath = [...pathArray];
+            return driveCache[key];
+        }
+        const res = await fetchApi({action:"list_drive", path:pathArray});
+        if(res.success){
+            driveCache[key] = {folders:res.folders||[], files:res.files||[], isLeaf:!!res.isLeaf};
+            driveFolders = res.folders||[];
+            driveFiles = res.files||[];
+            isCurrentLeaf = !!res.isLeaf;
+            currentDrivePath = [...pathArray];
+            return driveCache[key];
+        }
+        driveFolders=[]; driveFiles=[]; isCurrentLeaf=false;
+        return {folders:[], files:[], isLeaf:false};
+    }
+
+    async function setDrivePath(pathArray){
+        const grid=document.getElementById('results-grid');
+        if(grid) grid.innerHTML=`<div class="col-span-full py-12 text-center text-slate-400"><i class="fa-solid fa-circle-notch fa-spin text-2xl mb-2"></i><p class="text-sm font-bold">Loading ${pathArray.join('/')||'Root'}...</p></div>`;
+        currentSearchQuery="";
+        const sInput=document.getElementById('search-input');
+        if(sInput) sInput.value="";
+        await loadDriveFolder(pathArray);
+        renderDirectory();
+    }
+
+    function normalizeTask(t){
+        if(!t) return "";
+        const low=t.toLowerCase();
+        if(low.includes("trial")) return "trial papers";
+        if(low.includes("assess")) return "assessment tasks";
+        return low;
+    }
+    function normalizePath(p){
+        return p.split('/').map(s=>s.trim()).filter(Boolean).map(s=>{
+            const low=s.toLowerCase();
+            if(low.includes("trial")) return "Trial Papers";
+            if(low.includes("assess")) return "Assessment Tasks";
+            return s;
+        }).join('/').toLowerCase();
+    }
+    function getCommunityInCurrentPath(){
+        if(currentDrivePath.length===0) return [];
+        const currentPathNorm = normalizePath(currentDrivePath.join('/'));
+        return cachedData.filter(f=>{
+            const orig = (f.origPath || "").trim();
+            if(orig){
+                // Allow Trial vs Trial Papers to match via normalized path
+                if(normalizePath(orig) === currentPathNorm) return true;
+                // Also allow exact case-insensitive
+                if(orig.toLowerCase() === currentDrivePath.join('/').toLowerCase()) return true;
+                return false;
+            }
+            // Fallback: field-based with normalized task and exact depth
+            const [state, system, subject, task] = currentDrivePath;
+            const fState=(f.state||f.country||"").toLowerCase();
+            const fSys=(f.system||"").toLowerCase();
+            const fSub=(f.subject||"").toLowerCase();
+            const fTaskNorm=normalizeTask(f.task||"");
+            const curTaskNorm=normalizeTask(task||"");
+            if(state && fState!==state.toLowerCase()) return false;
+            if(system && fSys!==system.toLowerCase()) return false;
+            if(subject && fSub!==subject.toLowerCase()) return false;
+            if(task && fTaskNorm!==curTaskNorm) return false;
+            const fileDepth = [f.state, f.system, f.subject, f.task].filter(Boolean).length;
+            if(fileDepth !== currentDrivePath.length) return false;
+            return true;
+        });
+    }
+
+    function folderColor(name){
+        // Use first 3 chars to avoid NSW/NT collision
+        const three = (name.trim().substring(0,3).toUpperCase() || "AAA");
+        let hash=0;
+        for(let i=0;i<three.length;i++) hash = three.charCodeAt(i) + ((hash<<5)-hash);
+        const hue = Math.abs(hash) % 360;
+        const sat = 70 + (Math.abs(hash) % 20); // 70-90
+        return {
+            bg: `hsl(${hue}, ${sat}%, 92%)`,
+            iconBg: `hsl(${hue}, ${sat}%, 84%)`,
+            iconText: `hsl(${hue}, 50%, 32%)`,
+            border: `hsl(${hue}, 40%, 82%)`
+        };
+    }
+
+    function renderDirectory(){
+        const grid=document.getElementById('results-grid');
+        const bcEl=document.getElementById('breadcrumb');
+        let bc=`<button onclick="setDrivePath([])" class="hover:text-slate-900"><i class="fa-solid fa-house mr-1"></i> Home</button>`;
+        let accum=[];
+        currentDrivePath.forEach((seg,idx)=>{
+            accum.push(seg);
+            const copy=[...accum];
+            bc+=` <i class="fa-solid fa-chevron-right text-[10px] opacity-50"></i> <button onclick="setDrivePath(${JSON.stringify(copy).replace(/"/g,"'")})" class="${idx===currentDrivePath.length-1?'text-slate-900 font-black':''} hover:text-slate-900">${seg}</button>`;
+        });
+        bcEl.innerHTML=bc;
+
+        let filteredFolders=driveFolders;
+        if(currentSearchQuery){
+            const q=currentSearchQuery.toLowerCase();
+            filteredFolders=driveFolders.filter(f=>f.name.toLowerCase().includes(q));
+        }
+
+        if(filteredFolders.length>0 || driveFolders.length>0){
+            grid.className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5";
+            if(filteredFolders.length>0){
+                grid.innerHTML=filteredFolders.map(folder=>{
+                    const col=folderColor(folder.name);
+                    return `<div onclick="setDrivePath(${JSON.stringify([...currentDrivePath, folder.name]).replace(/"/g,"'")})" class="bg-white p-6 rounded-2xl shadow-sm border hover:shadow-md cursor-pointer flex items-center gap-4 group" style="border-color:${col.border}">
+                        <div class="p-3.5 rounded-xl" style="background:${col.iconBg}; color:${col.iconText}"><i class="fa-solid fa-folder text-2xl"></i></div>
+                        <div><h3 class="font-bold text-lg text-slate-900 leading-tight">${folder.name}</h3><p class="text-xs font-medium text-slate-500 mt-0.5">Folder</p></div>
+                    </div>`;
+                }).join('') + `<div class="col-span-full"><div id="files-list" class="flex flex-col gap-2.5 mt-2"></div></div>`;
+            }else{
+                grid.innerHTML=`<div class="col-span-full py-6 text-center text-slate-400 text-sm">No folders matching "${currentSearchQuery}"</div><div class="col-span-full"><div id="files-list" class="flex flex-col gap-2.5"></div></div>`;
+            }
+            renderFilesList();
+        }else{
+            grid.className="flex flex-col gap-2.5";
+            grid.innerHTML=`<div id="files-list"></div>`;
+            renderFilesList();
+        }
+        renderContributeButton();
+        updateSEO();
+    }
+
+    function renderFilesList(){
+        const listEl=document.getElementById('files-list');
+        if(!listEl) return;
+        let communityHere=getCommunityInCurrentPath();
+
+        // Build fileMap for voting and deduplicate
+        fileMap={};
+        let allFiles=[];
+
+        // Add drive files that are NOT already represented as community entry (to avoid duplicate when drive file was voted and created sheet entry)
+        const communityIds=new Set(communityHere.map(c=>c.id).concat(communityHere.map(c=>c.driveId).filter(Boolean)));
+        const driveOnly = driveFiles.filter(f=> !communityIds.has(f.id));
+        allFiles = [...driveOnly, ...communityHere];
+
+        // Populate map
+        allFiles.forEach(f=>{ fileMap[f.id]=f; });
+
+        if(currentSearchQuery){
+            const q=currentSearchQuery.toLowerCase();
+            allFiles=allFiles.filter(f=> String(f.school||"").toLowerCase().includes(q) || String(f.year||"").toLowerCase().includes(q) || String(f.subject||"").toLowerCase().includes(q) || String(f.task||"").toLowerCase().includes(q) || String(f.name||"").toLowerCase().includes(q));
+        }
+
+        // Sort modes
+        allFiles.sort((a,b)=>{
+            const sa=(a.school||"").toLowerCase(), sb=(b.school||"").toLowerCase();
+            const ya=parseInt(a.year)||0, yb=parseInt(b.year)||0;
+            if(currentSortMode==="year-desc"){ if(yb!==ya) return yb-ya; return sa.localeCompare(sb); }
+            if(currentSortMode==="year-asc"){ if(ya!==yb) return ya-yb; return sa.localeCompare(sb); }
+            if(currentSortMode==="school-desc"){ const c=sb.localeCompare(sa); if(c!==0) return c; return yb-ya; }
+            // school-asc default
+            const c=sa.localeCompare(sb); if(c!==0) return c; return yb-ya;
+        });
+
+        document.getElementById('count-text').innerText=`${allFiles.length} PAPERS`;
+
+        if(allFiles.length===0){
+            if(driveFolders.length>0 && !currentSearchQuery){ listEl.innerHTML=""; return; }
+            listEl.innerHTML=`<div class="py-12 text-center text-slate-400"><i class="fa-solid fa-file-pdf text-4xl mb-3 opacity-30"></i><p>No papers in this folder.</p></div>`;
+            return;
+        }
+
+        listEl.innerHTML=allFiles.map(f=>{
+            let uVote=null;
+            if(currentUser && f.voters){ try{ uVote=JSON.parse(f.voters)[currentUser.username]; }catch(e){} }
+            const hasSol=f.solutions==='Yes' || f.hasSol;
+            const solBadge=hasSol ? `<span class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 uppercase">with solutions</span>` : `<span class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-red-50 text-red-600 border border-red-200 uppercase">no solutions</span>`;
+            return `
+            <div id="file-card-${f.id}" class="bg-white px-4 sm:px-5 py-4 rounded-2xl border border-slate-200 hover:border-slate-300 hover:shadow-sm transition flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div class="flex-1 min-w-0">
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <h3 class="font-extrabold text-[17px] text-slate-900 leading-tight">${f.school||'Unknown School'}</h3>
+                        <span class="font-extrabold text-[17px] text-slate-900 leading-tight">${f.year||''}</span>
+                        <span class="text-[10px] font-bold px-2.5 py-1 rounded-full uppercase ${f.status==='Verified'?'bg-emerald-100 text-emerald-800':'bg-amber-100 text-amber-800'}"><i class="fa-solid ${f.status==='Verified'?'fa-circle-check':'fa-clock'} mr-1"></i>${f.status||'Unverified'}</span>
+                        ${solBadge}
+                    </div>
+                    <div class="mt-1 flex items-center gap-2 text-[13px] font-medium text-slate-500">
+                        <span class="text-slate-700 font-semibold">${f.subject||''}</span>
+                        ${f.task?`<span class="w-1 h-1 bg-slate-300 rounded-full"></span><span>${f.task}</span>`:''}
+                    </div>
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                    <a href="${f.url}" target="_blank" class="bg-slate-900 hover:bg-black text-white text-xs font-bold px-4 py-2.5 rounded-xl"><i class="fa-solid fa-download mr-1"></i> PDF</a>
+                    <div class="flex items-center rounded-xl border border-slate-200 overflow-hidden bg-slate-50">
+                        <button onclick="vote('${f.id}', 'up', this)" class="vote-btn-up px-3 py-2.5 text-xs font-bold flex items-center gap-1 ${uVote==='up'?'bg-emerald-500 text-white':'text-slate-500 hover:bg-white'}"><i class="fa-solid fa-arrow-up"></i><span class="v-cnt">${f.up||0}</span></button>
+                        <div class="w-px h-4 bg-slate-200"></div>
+                        <button onclick="vote('${f.id}', 'down', this)" class="vote-btn-down px-3 py-2.5 text-xs font-bold flex items-center gap-1 ${uVote==='down'?'bg-red-500 text-white':'text-slate-500 hover:bg-white'}"><i class="fa-solid fa-arrow-down"></i><span class="v-cnt">${f.down||0}</span></button>
+                    </div>
+                </div>
+            </div>`;
+        }).join('');
+    }
+
+    function renderContributeButton(){
+        const section=document.getElementById('contribute-section');
+        if(!section) return;
+        if(!isCurrentLeaf){
+            section.innerHTML=""; // hide if cannot contribute
+            return;
+        }
+        section.innerHTML=`
+            <div class="mt-8 mb-6 flex justify-center">
+                <div class="text-center">
+                    <button onclick="openContribute()" class="bg-theme hover-bg-theme text-slate-900 px-8 py-3 rounded-full text-sm font-black shadow-sm">
+                        <i class="fa-solid fa-cloud-arrow-up mr-2"></i>Contribute to this folder
+                    </button>
+                    <p class="text-[11px] font-bold text-slate-400 mt-2">Supports drag & drop • Drop PDFs anywhere in this folder • Batch upload</p>
+                </div>
+            </div>
+            <div id="drop-zone" class="hidden mt-2 border-2 border-dashed border-slate-300 rounded-2xl p-8 text-center bg-slate-50">
+                <i class="fa-solid fa-file-pdf text-4xl text-slate-300 mb-2"></i>
+                <p class="text-sm font-bold text-slate-600">Drag & Drop PDF files here or browse</p>
+                <p class="text-xs text-slate-400 mb-3">Max 45MB per file • Must be logged in • Stays in ${currentDrivePath.join(' / ')}</p>
+                <input id="u-files" type="file" accept="application/pdf" multiple class="hidden">
+                <button onclick="document.getElementById('u-files').click()" class="bg-white border border-slate-200 hover:bg-slate-50 shadow-sm text-slate-700 px-5 py-2 rounded-full text-xs font-bold">Browse Files</button>
+                <div id="batch-container" class="mt-4 text-left space-y-3 max-h-[340px] overflow-y-auto custom-scrollbar"></div>
+                <button id="btn-submit-upload" onclick="submitBatchUpload()" class="hidden mt-4 w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-3.5 rounded-xl shadow-md"><i class="fa-solid fa-upload mr-2"></i>Upload</button>
+            </div>
+        `;
+        setTimeout(initLocalDropZone, 50);
+    }
+
+    function openContribute(){
+        if(!currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
+        const dz=document.getElementById('drop-zone');
+        if(dz) dz.classList.toggle('hidden');
+    }
+
+    function initLocalDropZone(){
+        const dz=document.getElementById('drop-zone');
+        const ufi=document.getElementById('u-files');
+        if(!dz||!ufi) return;
+        // Use clone to remove old listeners if any
+        const newDz = dz.cloneNode(true);
+        dz.parentNode.replaceChild(newDz, dz);
+        const newUfi = document.getElementById('u-files');
+        // Re-bind after clone
+        newDz.addEventListener('dragover', e=>{ e.preventDefault(); newDz.classList.add('drag-active'); });
+        newDz.addEventListener('dragleave', e=>{ e.preventDefault(); newDz.classList.remove('drag-active'); });
+        newDz.addEventListener('drop', e=>{
+            e.preventDefault(); e.stopPropagation();
+            newDz.classList.remove('drag-active');
+            handleFiles(e.dataTransfer.files);
+        });
+        newUfi.addEventListener('change', e=>{
+            handleFiles(e.target.files);
+            e.target.value=''; // reset so same file can be selected again
+        });
+        // Re-attach batch container etc - need to re-render button handlers
+        // Re-init is okay, batch rendering will work
+    }
+
+    function setupGlobalDragOnce(){
+        if(globalDragSetup) return;
+        globalDragSetup=true;
+        const overlay=document.getElementById('global-drop-overlay');
+        let dragCounter=0;
+        document.addEventListener('dragenter', e=>{
+            e.preventDefault();
+            if(!isCurrentLeaf) return;
+            dragCounter++;
+            if(dragCounter===1){
+                overlay.classList.add('active');
+                document.getElementById('drop-path-label').innerText=currentDrivePath.join(' / ')||'Root';
+            }
+        });
+        document.addEventListener('dragover', e=>{ e.preventDefault(); });
+        document.addEventListener('dragleave', e=>{
+            e.preventDefault();
+            dragCounter--;
+            if(dragCounter<=0){
+                dragCounter=0;
+                overlay.classList.remove('active');
+            }
+        });
+        document.addEventListener('drop', e=>{
+            e.preventDefault();
+            dragCounter=0;
+            overlay.classList.remove('active');
+            if(!isCurrentLeaf) return;
+            // Prevent double handling - debounce
+            const now=Date.now();
+            if(now - lastDropTime < 300) return;
+            lastDropTime=now;
+            if(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length>0){
+                handleFiles(e.dataTransfer.files);
+                const dz=document.getElementById('drop-zone');
+                if(dz) dz.classList.remove('hidden');
+            }
+        });
+    }
+
+    function parsePaperFilename(filename){
+        const nameNoExt=filename.replace(/\.pdf$/i,'').trim();
+        const hasSol=/\bw\.?\s*sol\.?\b/i.test(nameNoExt);
+        const cleanName=nameNoExt.replace(/\s*\bw\.?\s*sol\.?\b/i,'').trim();
+        const yearMatch=cleanName.match(/\b(19\d{2}|20\d{2})\b/);
+        const year=yearMatch?yearMatch[0]:'';
+        let school=yearMatch?cleanName.substring(0,yearMatch.index).trim().replace(/[-_\s]+$/,'').trim():cleanName;
+        return {school:school.replace(/\s{2,}/g,' ').trim(), year, hasSol};
+    }
+
+    function handleFiles(files){
+        if(!isCurrentLeaf){ return; }
+        // Debounce duplicate drops
+        const now=Date.now();
+        if(now - lastDropTime < 200 && files.length===1){
+            // still allow but check duplicate name
+        }
+        lastDropTime=now;
+        const pdfs=Array.from(files).filter(f=>f.type==="application/pdf"||f.name.toLowerCase().endsWith('.pdf'));
+        if(pdfs.length===0) return;
+        // Deduplicate by name within batch and existing batchQueue
+        const existingNames=new Set(batchQueue.map(b=>b.originalName.toLowerCase()));
+        const newItems=[];
+        pdfs.forEach(f=>{
+            const lower=f.name.toLowerCase();
+            if(existingNames.has(lower)) return; // skip duplicate in queue
+            existingNames.add(lower);
+            const p=parsePaperFilename(f.name);
+            newItems.push({file:f, id:Date.now()+Math.random(), _school:p.school, _year:p.year, _sol:p.hasSol, originalName:f.name});
+        });
+        if(newItems.length===0) return alert("Those files are already queued.");
+        batchQueue=batchQueue.concat(newItems);
+        renderBatchUI();
+    }
+
+    function renderBatchUI(){
+        const container=document.getElementById('batch-container');
+        const btn=document.getElementById('btn-submit-upload');
+        if(!container) return;
+        if(batchQueue.length===0){ container.innerHTML=""; if(btn) btn.classList.add('hidden'); return; }
+        container.innerHTML=batchQueue.map((item,idx)=>`
+            <div class="border border-slate-200 p-3 rounded-2xl bg-white shadow-sm text-xs flex gap-3">
+                <div class="bg-slate-50 p-2.5 rounded-xl h-fit"><i class="fa-solid fa-file-pdf text-red-500"></i></div>
+                <div class="flex-1">
+                    <div class="flex justify-between"><span class="font-bold text-slate-800 truncate pr-2">${item.originalName}</span><button onclick="removeBatchItem(${idx})" class="text-slate-400 hover:text-red-500"><i class="fa-solid fa-times"></i></button></div>
+                    <div class="grid grid-cols-3 gap-2 mt-2">
+                        <div class="col-span-2"><label class="block text-[10px] font-bold uppercase text-slate-500 mb-1">School</label><input id="f-school-${idx}" value="${item._school}" class="w-full border p-2 rounded-lg bg-slate-50 outline-none font-medium"></div>
+                        <div><label class="block text-[10px] font-bold uppercase text-slate-500 mb-1">Year</label><input id="f-year-${idx}" value="${item._year}" class="w-full border p-2 rounded-lg bg-slate-50 outline-none font-medium"></div>
+                    </div>
+                    <label class="flex items-center gap-2 mt-2 font-bold cursor-pointer"><input type="checkbox" id="f-sol-${idx}" ${item._sol?'checked':''} class="w-4 h-4 accent-slate-900 rounded"> <span class="${item._sol?'text-emerald-700':'text-red-600'} text-xs">${item._sol?'with solutions':'no solutions'}</span></label>
+                </div>
+            </div>
+        `).join('');
+        if(btn){ btn.classList.remove('hidden'); btn.innerHTML=`<i class="fa-solid fa-upload mr-2"></i>Upload ${batchQueue.length} paper(s)`; }
+    }
+
+    function removeBatchItem(idx){ batchQueue.splice(idx,1); renderBatchUI(); }
+
+    async function submitBatchUpload(){
+        if(!currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
+        if(!isCurrentLeaf) return alert("Open Trial Papers or Assessment Tasks folder to upload.");
+        if(batchQueue.length===0) return;
+        const btn=document.getElementById('btn-submit-upload');
+        btn.disabled=true;
+        const originalPath=[...currentDrivePath];
+        for(let i=0;i<batchQueue.length;i++){
+            const school=document.getElementById(`f-school-${i}`)?.value?.trim()||batchQueue[i]._school;
+            const year=document.getElementById(`f-year-${i}`)?.value?.trim()||batchQueue[i]._year;
+            const sols=document.getElementById(`f-sol-${i}`)?.checked||false;
+            if(!school||!year){ alert(`Fill school/year for file #${i+1}`); btn.disabled=false; return; }
+            btn.innerHTML=`<i class="fa-solid fa-spinner fa-spin mr-2"></i>Uploading ${i+1}/${batchQueue.length}...`;
+            const base64=await new Promise(res=>{ const r=new FileReader(); r.onload=e=>res(e.target.result.split(',')[1]); r.readAsDataURL(batchQueue[i].file); });
+            const payload={ action:"upload", username:currentUser.username, password:JSON.parse(localStorage.getItem('openpapers_user_pw')||'""')||currentUser.password||prompt("Enter password:"), fileBase64:base64, school:school, year:year, solutions:sols, currentPath:originalPath, originalName:batchQueue[i].originalName };
+            if(payload.password) localStorage.setItem('openpapers_user_pw', JSON.stringify(payload.password));
+            const r=await fetchApi(payload);
+            if(!r.success){ alert(`Failed ${batchQueue[i].originalName}: ${r.message}`); btn.disabled=false; return; }
+        }
+        alert("Upload complete! Staying in this folder.");
+        batchQueue=[];
+        btn.disabled=false;
+        btn.innerHTML=`<i class="fa-solid fa-upload mr-2"></i>Upload`;
+        const key=originalPath.join('/')||'__root__';
+        delete driveCache[key];
+        await backgroundSyncPreservePath();
+    }
+
+    async function vote(fileId, dir, btn){
+        if(!currentUser) return document.getElementById('auth-modal').classList.remove('hidden');
+        const file = fileMap[fileId];
+        if(!file){
+            alert("File data not found, refreshing...");
+            await backgroundSyncPreservePath();
+            return;
+        }
+        // Find vote container
+        const card=document.getElementById(`file-card-${fileId}`);
+        if(!card){ return; }
+        const upBtn=card.querySelector('.vote-btn-up');
+        const downBtn=card.querySelector('.vote-btn-down');
+        if(!upBtn||!downBtn) return;
+
+        const isUp=dir==='up';
+        const targetBtn=isUp?upBtn:downBtn;
+        const otherBtn=isUp?downBtn:upBtn;
+
+        let cntEl=targetBtn.querySelector('.v-cnt');
+        let otherCntEl=otherBtn.querySelector('.v-cnt');
+        let wasActive=targetBtn.classList.contains('bg-emerald-500')||targetBtn.classList.contains('bg-red-500');
+        let otherWasActive=otherBtn.classList.contains('bg-emerald-500')||otherBtn.classList.contains('bg-red-500');
+
+        let cnt=parseInt(cntEl.innerText)||0;
+        let otherCnt=parseInt(otherCntEl.innerText)||0;
+
+        if(wasActive){
+            cnt--;
+            targetBtn.className="vote-btn-up px-3 py-2.5 text-xs font-bold flex items-center gap-1 text-slate-500 hover:bg-white";
+            if(isUp) targetBtn.classList.add('vote-btn-up'); else targetBtn.classList.add('vote-btn-down');
+        }else{
+            cnt++;
+            if(otherWasActive){
+                otherCnt--;
+                otherBtn.className=`${otherBtn.classList.contains('vote-btn-up')?'vote-btn-up':'vote-btn-down'} px-3 py-2.5 text-xs font-bold flex items-center gap-1 text-slate-500 hover:bg-white`;
+                otherCntEl.innerText=otherCnt;
+            }
+            targetBtn.className=`${isUp?'vote-btn-up':'vote-btn-down'} px-3 py-2.5 text-xs font-bold flex items-center gap-1 ${isUp?'bg-emerald-500 text-white':'bg-red-500 text-white'}`;
+        }
+        cntEl.innerText=cnt;
+
+        // Prepare drive info for backend (community-ran voting even for Drive files)
+        const isDriveFile=!!file.isDriveFile;
+        const driveInfo={
+            school:file.school||"", year:file.year||"", solutions:file.solutions||"No",
+            state:file.state||"", system:file.system||"", subject:file.subject||"", task:file.task||"",
+            url:file.url||"", originalName:file.name||file.originalName||"", path:file.path||"", status:file.status||"Verified"
+        };
+
+        const res=await fetchApi({action:"vote", fileId:fileId, vote:dir, username:currentUser.username, isDriveFile:isDriveFile, driveInfo:driveInfo});
+
+        if(!res.success){
+            alert(res.message);
+            await backgroundSyncPreservePath();
+        }else{
+            if(res.status==="Binned"){
+                card.style.opacity="0.5";
+                setTimeout(async()=>{
+                    const key=currentDrivePath.join('/')||'__root__';
+                    delete driveCache[key];
+                    await backgroundSyncPreservePath();
+                },600);
+            }else{
+                // Update cachedData locally to keep counts without full reload, but also refresh in background staying in folder
+                // For simplicity, refresh data but stay
+                await backgroundSyncPreservePath();
+            }
+        }
+    }
+
+    function updateAuthUI(){
+        const btn=document.getElementById('auth-btn');
+        if(!btn) return;
+        if(currentUser){ btn.innerHTML=`<i class="fa-solid fa-user-circle mr-1.5"></i>${currentUser.username}`; btn.onclick=openProfileModal; }
+        else{ btn.innerHTML=`<i class="fa-solid fa-right-to-bracket mr-1.5"></i>Log In`; btn.onclick=()=>document.getElementById('auth-modal').classList.remove('hidden'); }
+    }
+
+    function updateSEO(){
+        let title="OpenPapers | Australia High School Past Paper Repository";
+        if(currentDrivePath.length>0) title=`${currentDrivePath.join(' / ')} Past Papers | OpenPapers`;
+        document.title=title;
+    }
+
+    document.addEventListener('DOMContentLoaded', ()=>{
+        const input=document.getElementById('search-input');
+        if(input) input.addEventListener('input', e=>{ currentSearchQuery=e.target.value.trim(); renderDirectory(); });
+    });
+
+    function openProfileModal(){ document.getElementById('profile-modal').classList.remove('hidden'); switchTab('uploads'); }
+    function switchTab(tab){
+        document.getElementById('p-uploads').classList.toggle('hidden', tab!=='uploads');
+        document.getElementById('p-settings').classList.toggle('hidden', tab!=='settings');
+        document.getElementById('tab-uploads').className=`pb-2 font-bold text-sm ${tab==='uploads'?'text-slate-900 border-b-2 border-slate-900':'text-slate-400'}`;
+        document.getElementById('tab-settings').className=`pb-2 font-bold text-sm ${tab==='settings'?'text-slate-900 border-b-2 border-slate-900':'text-slate-400'}`;
+        if(tab==='uploads'){
+            const myFiles=cachedData.filter(f=>(f.uploader||"").toLowerCase()===(currentUser?.username||"").toLowerCase());
+            const container=document.getElementById('p-uploads');
+            if(myFiles.length===0){ container.innerHTML=`<div class="text-center text-slate-400 py-12"><i class="fa-solid fa-folder-open text-4xl mb-3 opacity-30"></i><p>You haven't uploaded any papers yet.</p></div>`; return; }
+            container.innerHTML=myFiles.map(f=>`
+                <div class="border border-slate-200 p-4 rounded-2xl flex justify-between items-center bg-white shadow-sm">
+                    <div><div class="flex items-center gap-2 mb-1.5"><span class="text-[10px] font-bold px-2 py-0.5 rounded uppercase ${f.status==='Verified'?'bg-emerald-100 text-emerald-800':'bg-amber-100 text-amber-800'}">${f.status}</span><span class="font-extrabold text-sm">${f.school} (${f.year})</span><span class="text-[10px] ${f.solutions==='Yes'?'bg-emerald-50 text-emerald-700':'bg-red-50 text-red-600'} border px-2 py-0.5 rounded-full font-bold uppercase">${f.solutions==='Yes'?'with solutions':'no solutions'}</span></div><p class="text-xs text-slate-500">${f.subject} - ${f.task}</p></div>
+                    <button onclick="binMyFile('${f.id}')" class="text-slate-500 hover:text-red-600 bg-slate-50 p-2.5 rounded-lg"><i class="fa-solid fa-trash"></i></button>
+                </div>`).join('');
+        }
+    }
+    async function binMyFile(id){ if(!confirm("Permanently remove?")) return; const r=await fetchApi({action:"bin_file", fileId:id, username:currentUser.username, password:currentUser.password}); if(r.success){ await backgroundSyncPreservePath(); switchTab('uploads'); } else alert(r.message); }
+    function logout(){ localStorage.removeItem('openpapers_user'); localStorage.removeItem('openpapers_user_pw'); currentUser=null; document.getElementById('profile-modal').classList.add('hidden'); updateAuthUI(); setDrivePath([]); }
+    async function changePassword(btn){ const o=document.getElementById('cp-old').value, n=document.getElementById('cp-new').value; if(!o||!n) return; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>'; const r=await fetchApi({action:"change_password", username:currentUser.username, oldPassword:o, newPassword:n}); alert(r.message); btn.innerText="Update Password"; if(r.success){ currentUser.password=n; localStorage.setItem('openpapers_user', JSON.stringify(currentUser)); localStorage.setItem('openpapers_user_pw', JSON.stringify(n)); document.getElementById('cp-old').value=''; document.getElementById('cp-new').value=''; } }
+    async function deleteAccount(btn){ const p=prompt("Confirm password:"); if(!p) return; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>'; const r=await fetchApi({action:"delete_account", username:currentUser.username, password:p}); if(r.success) logout(); else { alert(r.message); btn.innerText="Delete Account"; } }
+    async function doAuth(type, btn){
+        const u=document.getElementById('a-user').value.trim(); const p=document.getElementById('a-pass').value.trim(); if(!u||!p) return alert("Enter username and password.");
+        const orig=btn.innerText; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>';
+        const res=await fetchApi({action:type, username:u, password:p, ip:userIP}); btn.innerText=orig;
+        if(res.success && type==='login'){ currentUser={username:u, password:p, isAdmin:res.is_admin}; localStorage.setItem('openpapers_user', JSON.stringify(currentUser)); localStorage.setItem('openpapers_user_pw', JSON.stringify(p)); document.getElementById('auth-modal').classList.add('hidden'); updateAuthUI(); } else alert(res.message);
+    }
+
+    window.onload=initialLoad;
+</script>
+
+<nav class="glass-nav fixed top-4 inset-x-4 md:inset-x-auto md:w-[900px] md:left-1/2 md:-translate-x-1/2 z-40 rounded-full px-6 py-3 flex justify-between items-center shadow-lg">
+    <h1 class="font-extrabold text-xl tracking-tight cursor-pointer" onclick="setDrivePath([])"><i class="fa-solid fa-book-open text-theme-dark mr-2"></i>OpenPapers</h1>
+    <div class="flex items-center gap-3">
+        <button id="auth-btn" class="text-slate-700 hover:text-slate-900 text-sm font-bold px-3 py-2"></button>
+        <button onclick="document.getElementById('faq-modal').classList.remove('hidden')" class="bg-theme px-5 py-2.5 rounded-full text-sm font-bold">FAQ</button>
+    </div>
+</nav>
+
+<div class="p-4 md:p-6 pt-24 md:pt-28">
+    <header class="bg-theme rounded-[2.5rem] py-16 px-6 text-center shadow-md">
+        <h2 class="text-4xl md:text-5xl font-black mb-2 tracking-tight">OpenPapers</h2>
+        <h3 class="text-base md:text-lg font-bold opacity-80 mb-3">Australia-wide community ran high school university admission exam past paper archive</h3>
+        <p class="mb-8 max-w-2xl mx-auto text-sm font-medium opacity-90">Browse, upload, and verify past papers from any Australian school and state.<br>If your state or subject is not found, email me and I will add it for you.</p>
+        <div class="max-w-2xl mx-auto">
+            <div id="search-bar-box" class="bg-white p-2.5 rounded-2xl flex items-center shadow-xl">
+                <i class="fa-solid fa-search text-slate-400 ml-2 mr-2.5 text-sm"></i>
+                <input id="search-input" type="text" placeholder="Search folders and papers in this folder..." class="w-full bg-transparent outline-none text-sm font-medium">
+            </div>
+        </div>
+    </header>
+</div>
+
+<main class="flex-grow px-6 pb-12 max-w-6xl mx-auto w-full">
+    <div class="flex flex-wrap justify-between items-center gap-3 mb-2">
+        <div id="breadcrumb" class="flex items-center gap-2 text-sm font-bold text-slate-500 overflow-x-auto whitespace-nowrap"></div>
+        <div class="flex items-center gap-3">
+            <p id="count-text" class="text-slate-400 text-xs font-bold uppercase"></p>
+            <div class="flex items-center gap-2 bg-white border border-slate-200 rounded-full px-3 py-1.5 shadow-sm">
+                <i class="fa-solid fa-arrow-down-wide-short text-slate-400 text-xs"></i>
+                <select id="sort-select" onchange="setSort(this.value)" class="bg-transparent text-xs font-bold text-slate-700 outline-none cursor-pointer pr-1">
+                    <option value="school-asc">School A → Z</option>
+                    <option value="school-desc">School Z → A</option>
+                    <option value="year-desc">Year Newest</option>
+                    <option value="year-asc">Year Oldest</option>
+                </select>
+            </div>
+        </div>
+    </div>
+    <script>function setSort(v){ currentSortMode=v; renderDirectory(); }</script>
+    <div id="contribute-section"></div>
+    <div id="results-grid" class="flex flex-col gap-2.5 mt-8"></div>
+</main>
+
+<footer class="bg-slate-900 text-slate-400 py-12 px-6 text-center text-xs mt-auto border-t border-slate-800">
+    <div class="flex justify-center gap-4 mb-4 font-bold text-sm flex-wrap">
+        <a href="https://github.com/kaheichanturtle/openpapers" target="_blank" class="text-white hover:text-[#ffe294]"><i class="fa-brands fa-github mr-1"></i> Open Source Repository</a>
+        <span class="text-slate-600">•</span>
+        <button onclick="document.getElementById('faq-modal').classList.remove('hidden')" class="text-white hover:text-[#ffe294]">FAQ</button>
+        <span class="text-slate-600">•</span>
+        <a href="mailto:2uh114cu@duck.com" class="text-white hover:text-[#ffe294]"><i class="fa-solid fa-envelope mr-1"></i> Contact & DMCA</a>
+    </div>
+    <p class="font-bold text-white text-sm mb-1">© Shellcraft Studios, 2026</p>
+    <p class="mb-4 text-slate-500">As part of Project Freedom Bell</p>
+    <a href="https://revolut.me/kaheichan" target="_blank" class="inline-block bg-slate-800 hover:bg-slate-700 text-white font-bold py-2 px-6 rounded-full mb-6 border border-slate-700"><i class="fa-solid fa-mug-hot mr-2 text-[#ffe294]"></i> Support me & keep the site running</a>
+    <p class="max-w-2xl mx-auto opacity-60 leading-relaxed">Disclaimer: Ensure uploaded files are not copyrighted material and you have permission to distribute them. For any copyright breaches or DMCA notices, email <a href="mailto:2uh114cu@duck.com" class="text-[#ffe294] hover:underline">2uh114cu@duck.com</a>. User credentials and storage are managed securely on Google infrastructure. IP addresses are collected only at signup to enforce community spam blocks.</p>
+</footer>
+
+<div id="loading" class="fixed inset-0 bg-slate-900/90 backdrop-blur-md z-50 flex flex-col items-center justify-center text-white">
+    <i class="fa-solid fa-circle-notch fa-spin text-4xl text-[#ffe294] mb-4"></i>
+    <h2 class="text-xl font-bold tracking-widest uppercase">OPENPAPERS</h2>
+    <p class="text-slate-400 text-sm mt-2">Connecting to cloud database...</p>
+</div>
+
+<div id="profile-modal" class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-3xl w-full max-w-3xl p-6 shadow-2xl flex flex-col max-h-[90vh]">
+        <div class="flex justify-between items-center mb-6"><h3 class="text-xl font-extrabold"><i class="fa-solid fa-user-circle text-theme-dark mr-2"></i>My Profile</h3><button onclick="document.getElementById('profile-modal').classList.add('hidden')" class="text-slate-400 text-xl"><i class="fa-solid fa-times"></i></button></div>
+        <div class="flex gap-4 border-b border-slate-200 mb-4"><button onclick="switchTab('uploads')" id="tab-uploads" class="pb-2 font-bold text-slate-900 border-b-2 border-slate-900 text-sm">My Uploads</button><button onclick="switchTab('settings')" id="tab-settings" class="pb-2 font-bold text-slate-400 text-sm">Account Settings</button></div>
+        <div id="p-uploads" class="overflow-y-auto custom-scrollbar pr-2 space-y-3 flex-grow min-h-[300px]"></div>
+        <div id="p-settings" class="hidden space-y-6"><div class="bg-slate-50 p-5 rounded-2xl border"><h4 class="font-bold text-sm mb-3"><i class="fa-solid fa-lock mr-2"></i>Change Password</h4><input id="cp-old" type="password" placeholder="Current Password" class="w-full border p-3 rounded-xl text-sm mb-3"><input id="cp-new" type="password" placeholder="New Password" class="w-full border p-3 rounded-xl text-sm mb-4"><button onclick="changePassword(this)" class="bg-slate-800 text-white font-bold px-5 py-2.5 rounded-xl text-sm">Update Password</button></div><div class="bg-red-50 p-5 rounded-2xl border border-red-100 flex justify-between items-center"><div><h4 class="font-bold text-sm text-red-700">Danger Zone</h4><p class="text-xs text-red-500 mt-1">Permanently delete your account.</p></div><button onclick="deleteAccount(this)" class="bg-red-600 text-white font-bold px-5 py-2.5 rounded-xl text-sm">Delete Account</button></div><button onclick="logout()" class="w-full bg-slate-200 text-slate-800 font-bold py-3.5 rounded-xl text-sm mt-4"><i class="fa-solid fa-right-from-bracket mr-2"></i>Log Out</button></div>
+    </div>
+</div>
+
+<div id="auth-modal" class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-[2rem] w-full max-w-md p-8 shadow-2xl max-h-[90vh] overflow-y-auto custom-scrollbar">
+        <h3 class="text-2xl font-black text-slate-900 mb-2 text-center">OpenPapers Account</h3>
+        <p class="text-xs text-slate-500 mb-6 font-medium text-center">Log in or create an account to vote and upload papers.</p>
+        <div class="space-y-3">
+            <input id="a-user" type="text" placeholder="Username" class="w-full border border-slate-200 p-3.5 rounded-xl outline-none text-sm bg-slate-50">
+            <input id="a-pass" type="password" placeholder="Password" class="w-full border border-slate-200 p-3.5 rounded-xl outline-none text-sm bg-slate-50">
+            <div class="flex gap-3 pt-2"><button onclick="doAuth('login', this)" class="w-1/2 bg-slate-900 text-white font-bold py-3.5 rounded-xl text-sm">Login</button><button onclick="doAuth('register', this)" class="w-1/2 bg-theme text-slate-900 font-bold py-3.5 rounded-xl text-sm">Register</button></div>
+            <div class="pt-4 border-t border-slate-100">
+                <button onclick="document.getElementById('privacy-accordion').classList.toggle('hidden')" class="w-full flex justify-between items-center text-xs font-bold text-slate-500 hover:text-slate-800 py-1">
+                    <span>Why do I need an account & Security Info</span><i class="fa-solid fa-chevron-down text-[10px]"></i>
+                </button>
+                <div id="privacy-accordion" class="hidden mt-2 p-3 bg-slate-50 rounded-xl text-xs text-slate-500 space-y-2 leading-relaxed border">
+                    <p><strong>Anti-Spam Community Integrity:</strong> Accounts are required solely to verify paper contributors and allow fair community voting to weed out trolls.</p>
+                    <p><strong>Cloud Security:</strong> No one except the automated server can access your credentials. All data is managed on Google Cloud servers. Review Google's Privacy Policy for infrastructure details.</p>
+                    <p><strong>No Data Tracking:</strong> We do not track or sell personal information. IP addresses are logged strictly to enforce IP blocks if an address repeatedly uploads fraudulent or malicious files.</p>
+                    <p><strong>100% Open Source:</strong> Inspect our site code at <a href="https://github.com/kaheichanturtle/openpapers" target="_blank" class="text-indigo-600 font-bold underline">github.com/kaheichanturtle/openpapers</a>. Inquiries: <a href="mailto:2uh114cu@duck.com" class="text-indigo-600 font-bold">2uh114cu@duck.com</a>.</p>
+                </div>
+            </div>
+            <button onclick="document.getElementById('auth-modal').classList.add('hidden')" class="w-full text-slate-400 hover:text-slate-600 text-xs py-2 font-bold uppercase">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<div id="faq-modal" class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-[70] p-4">
+    <div class="bg-white rounded-[2rem] w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+        <div class="flex justify-between items-center p-7 pb-4 border-b"><h3 class="text-xl font-black"><i class="fa-solid fa-circle-question text-theme-dark mr-2"></i>FAQ - OpenPapers</h3><button onclick="document.getElementById('faq-modal').classList.add('hidden')" class="text-slate-400 text-xl"><i class="fa-solid fa-times"></i></button></div>
+        <div class="overflow-y-auto custom-scrollbar p-6 space-y-3">
+            <div class="faq-item border rounded-2xl overflow-hidden"><button onclick="toggleFAQ(this)" class="w-full flex justify-between items-center p-4 text-left font-bold text-sm hover:bg-slate-50"><span>What is OpenPapers?</span><i class="fa-solid fa-chevron-down text-xs"></i></button><div class="faq-answer hidden px-4 pb-4 text-xs text-slate-600">OpenPapers is a Australia-wide, community-run, open-source past paper repository. Students upload trial, assessment, and exam papers from their schools, and the community verifies them via upvotes. All files are hosted on Google Drive CDN for fast downloads. No paywalls, no ads on downloads.</div></div>
+            <div class="faq-item border rounded-2xl overflow-hidden"><button onclick="toggleFAQ(this)" class="w-full flex justify-between items-center p-4 text-left font-bold text-sm hover:bg-slate-50"><span>Is it really free? Do I need an account to download?</span><i class="fa-solid fa-chevron-down text-xs"></i></button><div class="faq-answer hidden px-4 pb-4 text-xs text-slate-600">Downloading is 100% free and requires no account. You only need an account to upload papers or vote to help verify papers. We don't show ads on download pages and we never limit your downloads.</div></div>
+            <div class="faq-item border rounded-2xl overflow-hidden"><button onclick="toggleFAQ(this)" class="w-full flex justify-between items-center p-4 text-left font-bold text-sm hover:bg-slate-50"><span>How does verification work?</span><i class="fa-solid fa-chevron-down text-xs"></i></button><div class="faq-answer hidden px-4 pb-4 text-xs text-slate-600">Every paper starts as <span class="font-bold text-amber-700">Unverified</span>. When it gets 15+ votes and 90%+ upvotes, it becomes <span class="font-bold text-emerald-700">Verified</span>. If 70%+ downvotes, it's automatically binned. This community voting weeds out incorrect or spam files, even Drive files can be binned if community downvotes.</div></div>
+            <div class="faq-item border rounded-2xl overflow-hidden"><button onclick="toggleFAQ(this)" class="w-full flex justify-between items-center p-4 text-left font-bold text-sm hover:bg-slate-50"><span>What about Studocu? THSC? Other sites? Why this?</span><i class="fa-solid fa-chevron-down text-xs"></i></button><div class="faq-answer hidden px-4 pb-4 text-xs text-slate-600">These sites are great for finding past papers, but for example Studocu, are filled with ads and have limits, such as requiring you to login to view files, which could be annoying for some, while the known NSW Trial past paper site, THSC online, is great but when traffic is high, will lead to loading the files super slow and annoying. OpenPapers runs on Google's CDN, ensuring blazing fast downloads. Moreover, other states does not have such a resource, and OpenPapers is built to breach the gap.</div></div>
+            <div class="faq-item border rounded-2xl overflow-hidden"><button onclick="toggleFAQ(this)" class="w-full flex justify-between items-center p-4 text-left font-bold text-sm hover:bg-slate-50"><span>What about copyright?</span><i class="fa-solid fa-chevron-down text-xs"></i></button><div class="faq-answer hidden px-4 pb-4 text-xs text-slate-600">Uploaders must ensure they have permission to share. If you are a copyright holder, email <a href="mailto:2uh114cu@duck.com" class="font-bold text-indigo-600">2uh114cu@duck.com</a> with a DMCA request and we remove immediately. We log IPs at signup only to block spam.</div></div>
+            <div class="faq-item border rounded-2xl overflow-hidden"><button onclick="toggleFAQ(this)" class="w-full flex justify-between items-center p-4 text-left font-bold text-sm hover:bg-slate-50"><span>How can I help make it Australia-wide?</span><i class="fa-solid fa-chevron-down text-xs"></i></button><div class="faq-answer hidden px-4 pb-4 text-xs text-slate-600">Upload papers from your state! The system auto-creates folders for new states/systems. Share the site on your school Discord, Reddit, etc.</div></div>
+        </div>
+        <div class="p-4 border-t text-center"><button onclick="document.getElementById('faq-modal').classList.add('hidden')" class="text-slate-400 text-xs font-bold uppercase">Close</button></div>
+    </div>
+</div>
+
+<script>function toggleFAQ(btn){ const ans=btn.nextElementSibling; ans.classList.toggle('hidden'); }</script>
+
+</body>
+</html>
